@@ -13,6 +13,11 @@ class SharkSnap:
     axes_fontsize = 14
     
     def __init__(self, data_path, snapshot, nsubvols, min_gal_mass_Msun_h=1.0e8):
+        self.min_gal_mass_Msun_h = min_gal_mass_Msun_h
+        self.data_path = data_path
+        self.snapshot = snapshot
+        self.nsubvols = nsubvols
+
         # open the first file to define the column names
         galaxies_file_fmt = "{:s}/{:d}/{:d}/galaxies.hdf5"
         
@@ -24,15 +29,11 @@ class SharkSnap:
             self.omega_m = f["cosmology/omega_m"][()]
             self.omega_l = f["cosmology/omega_l"][()]
             self.omega_b = f["cosmology/omega_b"][()]
-
-            for column in f["galaxies"].keys():
-                columns.append(column)
+            self.redshift = f["run_info/redshift"][()]
+            self.particle_mass = f["run_info/particle_mass"][()]
 
         from astropy.cosmology import FlatLambdaCDM
         self.cosmo = FlatLambdaCDM(Om0=self.omega_m, H0=100.*self.h)
-        
-        # empty DataFrame for now, fill with all file information
-        self.df = pd.DataFrame(columns)
         
         for i in range(nsubvols):
             with h5py.File(galaxies_file_fmt.format(data_path, snapshot, i)) as f:
@@ -40,11 +41,39 @@ class SharkSnap:
                 for key in f["galaxies"].keys():
                     data.update({key: np.array(f["galaxies/{:s}".format(key)])})
 
-                self.df = pd.concat([self.df, pd.DataFrame(data)], ignore_index=True)
-
-                # Already set the i = 0 case above
+                # Keep track of the subvolume because the ID is unique to the subvolume only
+                data.update({"subvolume": np.uint64(i) * np.ones(len(data[key]), dtype=np.uint64)})
                 if i > 0:
+                    self.df = pd.concat([self.df, pd.DataFrame(data)], ignore_index=True)
+                    # Add each subvolume to the total volume
                     self.volume += f["run_info/effective_volume"][()]  # cMpc/h
+                else:
+                    self.df = pd.DataFrame(data)
+
+        sentinel32 = np.uint32(2**32 - 1)  # 0xFFFFFFFF
+
+        id_gal = (
+            self.df["id_galaxy"]
+                .astype("Int64")
+                .fillna(-1)
+                .replace(-1, sentinel32)
+                .to_numpy()
+                .astype(np.uint32)
+        )
+
+        id_desc = (
+            self.df["descendant_id_galaxy"]
+                .astype("Int64")
+                .fillna(-1)
+                .replace(-1, sentinel32)
+                .to_numpy()
+                .astype(np.uint32)
+        )
+
+        subvol = self.df["subvolume"].to_numpy().astype(np.uint64)
+
+        self.df["global_descendant_id_galaxy"] = (subvol << 32) | id_desc
+        self.df["global_id_galaxy"] = (subvol << 32) | id_gal
 
         # These keys are split into disk and bulge components, useful to have the
         # sum total.
@@ -63,7 +92,8 @@ class SharkSnap:
         for key in keys:
             self.df[key] = self.df[key] % self.lbox
 
-        # These keys do not need to be reset to a reasonable value for log-operations
+        # IMPORTANT: Must set keys here that do not need to have a floor set
+        # for log operations.
         keys = ["descendant_id_galaxy",
                 "id_galaxy",
                 "id_halo",
@@ -78,7 +108,10 @@ class SharkSnap:
                 "type",
                 "velocity_x",
                 "velocity_y",
-                "velocity_z"]
+                "velocity_z",
+                "subvolume",
+                "global_id_galaxy",
+                "global_descendant_id_galaxy"]
         for col in self.df.columns:
             if col in keys:
                 continue
